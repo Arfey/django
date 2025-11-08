@@ -562,6 +562,28 @@ class ASGITest(SimpleTestCase):
         # The signal sender is the handler class.
         self.assertEqual(handler_call["kwargs"], {"sender": TestASGIHandler})
 
+        # Test cancelling the handler task not via http.disconnect
+        application = TestASGIHandler()
+        scope = self.async_request_factory._base_scope(path="/cancel/")
+        communicator = ApplicationCommunicator(application, scope)
+        await communicator.send_input({"type": "http.request"})
+
+        # Wait for the view to start.
+        await view_started.wait()
+
+        # Cancel the handler task directly.
+        handler_task = communicator.future
+        handler_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await handler_task
+
+        await communicator.wait()
+        self.assertIs(view_did_cancel, True)
+        self.assertEqual(len(signal_handler.calls), 1)
+        handler_call = signal_handler.calls.pop()
+        self.assertNotEqual(handler_call["thread"], threading.current_thread())
+        self.assertEqual(handler_call["kwargs"], {"sender": TestASGIHandler})
+
     async def test_asyncio_streaming_cancel_error(self):
         # Similar to test_asyncio_cancel_error(), but during a streaming
         # response.
