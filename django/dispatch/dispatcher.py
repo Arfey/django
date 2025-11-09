@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import logging
 import threading
 import weakref
@@ -22,7 +23,21 @@ NONE_ID = _make_id(None)
 NO_RECEIVERS = object()
 
 
+def _restore_context(context: contextvars.Context) -> None:
+    # Check for changes in contextvars, and set them to the current
+    # context for downstream consumers
+    for cvar in context:
+        cvalue = context.get(cvar)
+        try:
+            if cvar.get() != cvalue:
+                cvar.set(cvalue)
+        except LookupError:
+            cvar.set(cvalue)
+
+
 async def _gather(*coros):
+    context = contextvars.copy_context()
+
     if len(coros) == 0:
         return []
 
@@ -36,12 +51,14 @@ async def _gather(*coros):
         async with asyncio.TaskGroup() as tg:
             results = [None] * len(coros)
             for i, coro in enumerate(coros):
-                tg.create_task(run(i, coro))
+                tg.create_task(run(i, coro), context=context)
         return results
     except BaseExceptionGroup as exception_group:
         if len(exception_group.exceptions) == 1:
             raise exception_group.exceptions[0]
         raise
+    finally:
+        _restore_context(context=context)
 
 
 class Signal:
