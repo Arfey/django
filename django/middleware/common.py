@@ -1,37 +1,23 @@
 import re
 from urllib.parse import urlsplit
 
+from asgiref.sync import iscoroutinefunction, markcoroutinefunction
+
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.core.mail import mail_managers
 from django.http import HttpResponsePermanentRedirect
 from django.urls import is_valid_path
+from django.utils.decorators import async_only_middleware
 from django.utils.deprecation import MiddlewareMixin
 from django.utils.http import escape_leading_slashes
 
 
-class CommonMiddleware(MiddlewareMixin):
-    """
-    "Common" middleware for taking care of some basic operations:
-
-        - Forbid access to User-Agents in settings.DISALLOWED_USER_AGENTS
-
-        - URL rewriting: Based on the APPEND_SLASH and PREPEND_WWW settings,
-          append missing slashes and/or prepends missing "www."s.
-
-            - If APPEND_SLASH is set and the initial URL doesn't end with a
-              slash, and it is not found in urlpatterns, form a new URL by
-              appending a slash at the end. If this new URL is found in
-              urlpatterns, return an HTTP redirect to this new URL; otherwise
-              process the initial URL as usual.
-
-          This behavior can be customized by subclassing CommonMiddleware and
-          overriding the response_redirect_class attribute.
-    """
+class BaseCommonMiddlewareMixin:
 
     response_redirect_class = HttpResponsePermanentRedirect
 
-    def process_request(self, request):
+    def pre_request(self, request):
         """
         Check for denied User-Agents and rewrite the URL based on
         settings.APPEND_SLASH and settings.PREPEND_WWW
@@ -97,7 +83,7 @@ class CommonMiddleware(MiddlewareMixin):
             )
         return new_path
 
-    def process_response(self, request, response):
+    def post_response(self, request, response):
         """
         When the status code of the response is 404, it may redirect to a path
         with an appended slash if should_redirect_with_slash() returns True.
@@ -115,6 +101,65 @@ class CommonMiddleware(MiddlewareMixin):
             response.headers["Content-Length"] = str(len(response.content))
 
         return response
+
+
+class CommonMiddleware(BaseCommonMiddlewareMixin, MiddlewareMixin):
+    """
+    "Common" middleware for taking care of some basic operations:
+
+        - Forbid access to User-Agents in settings.DISALLOWED_USER_AGENTS
+
+        - URL rewriting: Based on the APPEND_SLASH and PREPEND_WWW settings,
+          append missing slashes and/or prepends missing "www."s.
+
+            - If APPEND_SLASH is set and the initial URL doesn't end with a
+              slash, and it is not found in urlpatterns, form a new URL by
+              appending a slash at the end. If this new URL is found in
+              urlpatterns, return an HTTP redirect to this new URL; otherwise
+              process the initial URL as usual.
+
+          This behavior can be customized by subclassing CommonMiddleware and
+          overriding the response_redirect_class attribute.
+    """
+
+    def process_request(self, request):
+        return self.pre_request(request=request)
+
+    def process_response(self, request, response):
+        return self.post_response(request=request, response=response)
+
+
+@async_only_middleware
+class AsyncCommonMiddleware(BaseCommonMiddlewareMixin):
+    """
+    "Common" middleware for taking care of some basic operations:
+
+        - Forbid access to User-Agents in settings.DISALLOWED_USER_AGENTS
+
+        - URL rewriting: Based on the APPEND_SLASH and PREPEND_WWW settings,
+          append missing slashes and/or prepends missing "www."s.
+
+            - If APPEND_SLASH is set and the initial URL doesn't end with a
+              slash, and it is not found in urlpatterns, form a new URL by
+              appending a slash at the end. If this new URL is found in
+              urlpatterns, return an HTTP redirect to this new URL; otherwise
+              process the initial URL as usual.
+
+          This behavior can be customized by subclassing CommonMiddleware and
+          overriding the response_redirect_class attribute.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        if iscoroutinefunction(self.get_response):
+            markcoroutinefunction(self)
+
+    async def __call__(self, request):
+        response = self.pre_request(request=request)
+        if response is not None:
+            return response
+        response = await self.get_response(request)
+        return self.post_response(request=request, response=response)
 
 
 class BrokenLinkEmailsMiddleware(MiddlewareMixin):
