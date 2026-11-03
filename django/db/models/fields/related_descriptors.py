@@ -65,7 +65,7 @@ and two directions (forward and reverse) for a total of six combinations.
 
 from functools import cached_property
 
-from asgiref.sync import sync_to_async
+from django.db.transaction import guarded_sync_to_async as sync_to_async  # PROTOTYPE
 
 from django.core.exceptions import FieldError
 from django.db import (

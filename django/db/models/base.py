@@ -5,7 +5,7 @@ from collections import defaultdict
 from functools import partialmethod
 from itertools import chain
 
-from asgiref.sync import sync_to_async
+from django.db.transaction import guarded_sync_to_async as sync_to_async  # PROTOTYPE
 
 import django
 from django.apps import apps
