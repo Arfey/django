@@ -1,7 +1,11 @@
+import asyncio
 import warnings
 from asyncio import iscoroutinefunction
 from contextlib import ContextDecorator, contextmanager
+from contextvars import ContextVar
 from functools import wraps
+
+from asgiref.sync import SyncToAsync, sync_to_async
 
 from django.db import (
     DEFAULT_DB_ALIAS,
@@ -151,6 +155,47 @@ def on_commit(func, using=None, robust=False):
 #################################
 # Decorators / context managers #
 #################################
+
+
+# PROTOTYPE: only the top block's owner or its child tasks use the connection.
+_async_atomic_chain = ContextVar("async_atomic_chain", default=())
+
+
+class _ConnectionTurn:
+    def __init__(self):
+        self.stack = []
+        self.condition = asyncio.Condition()
+
+    def can_use(self):
+        return not self.stack or self.stack[-1] in _async_atomic_chain.get()
+
+
+# Keyed by event loop and sync thread (not per alias).
+_turns = {}
+
+
+def _get_turn():
+    key = (
+        asyncio.get_running_loop(),
+        SyncToAsync.thread_sensitive_context.get(None),
+    )
+    if key not in _turns:
+        _turns[key] = _ConnectionTurn()
+    return _turns[key]
+
+
+def guarded_sync_to_async(func, *args, **kwargs):
+    """sync_to_async() that waits for this task's turn on the connection."""
+    inner = sync_to_async(func, *args, **kwargs)
+
+    @wraps(func)
+    async def wrapper(*a, **kw):
+        turn = _get_turn()
+        async with turn.condition:
+            await turn.condition.wait_for(turn.can_use)
+        return await inner(*a, **kw)
+
+    return wrapper
 
 
 class Atomic(ContextDecorator):
@@ -325,6 +370,37 @@ class Atomic(ContextDecorator):
                     connection.connection = None
                 else:
                     connection.in_atomic_block = False
+
+    async def __aenter__(self):
+        turn = _get_turn()
+        token = object()
+        async with turn.condition:
+            await turn.condition.wait_for(turn.can_use)
+            # Reserve the top before awaiting.
+            turn.stack.append(token)
+        try:
+            await sync_to_async(self.__enter__)()
+        except BaseException:
+            async with turn.condition:
+                turn.stack.remove(token)
+                turn.condition.notify_all()
+            raise
+        _async_atomic_chain.set((*_async_atomic_chain.get(), token))
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        turn = _get_turn()
+        *chain, token = _async_atomic_chain.get()
+        _async_atomic_chain.set(tuple(chain))
+        async with turn.condition:
+            # Wait for inner blocks in other tasks to close.
+            await turn.condition.wait_for(lambda: turn.stack[-1] is token)
+        try:
+            return await sync_to_async(self.__exit__)(exc_type, exc_value, traceback)
+        finally:
+            async with turn.condition:
+                turn.stack.pop()
+                turn.condition.notify_all()
 
 
 def atomic(using=None, savepoint=True, durable=False):
